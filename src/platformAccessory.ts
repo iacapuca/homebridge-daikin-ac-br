@@ -1,148 +1,411 @@
-import type { CharacteristicValue, PlatformAccessory, Service } from 'homebridge';
+import type {
+  CharacteristicValue,
+  PlatformAccessory,
+  Service
+} from 'homebridge'
 
-import type { ExampleHomebridgePlatform } from './platform.js';
+import type { DaikinPlatform } from './platform.js'
+import { DaikinClient, ACMode, FanSpeed } from './daikin/index.js'
+import type { ACState } from './daikin/index.js'
 
 /**
  * Platform Accessory
  * An instance of this class is created for each accessory your platform registers
  * Each accessory may expose multiple services of different service types.
  */
-export class ExamplePlatformAccessory {
-  private service: Service;
+export class DaikinPlatformAccessory {
+  private service: Service
+  private currentState: ACState | null = null
+  private pollInterval: NodeJS.Timeout | null = null
+
+  constructor (
+    private readonly platform: DaikinPlatform,
+    private readonly accessory: PlatformAccessory,
+    private readonly client: DaikinClient
+  ) {
+    // Set accessory information
+    const device = this.accessory.context.device
+    this.accessory
+      .getService(this.platform.Service.AccessoryInformation)!
+      .setCharacteristic(this.platform.Characteristic.Manufacturer, 'Daikin')
+      .setCharacteristic(
+        this.platform.Characteristic.Model,
+        device.model || 'Daikin AC'
+      )
+      .setCharacteristic(
+        this.platform.Characteristic.SerialNumber,
+        device.mac || device.ip
+      )
+      .setCharacteristic(
+        this.platform.Characteristic.FirmwareRevision,
+        device.firmwareVersion || '1.0.0'
+      )
+
+    // Get or create the HeaterCooler service (perfect for AC units)
+    this.service =
+      this.accessory.getService(this.platform.Service.HeaterCooler) ||
+      this.accessory.addService(this.platform.Service.HeaterCooler)
+
+    // Set the service name
+    this.service.setCharacteristic(
+      this.platform.Characteristic.Name,
+      this.accessory.displayName
+    )
+
+    // Configure HeaterCooler characteristics
+    // Active (required) - whether the device is on/off
+    this.service
+      .getCharacteristic(this.platform.Characteristic.Active)
+      .onSet(this.setActive.bind(this))
+      .onGet(this.getActive.bind(this))
+
+    // Current Heater Cooler State (required) - current operating state
+    this.service
+      .getCharacteristic(this.platform.Characteristic.CurrentHeaterCoolerState)
+      .onGet(this.getCurrentHeaterCoolerState.bind(this))
+
+    // Target Heater Cooler State (required) - desired operating mode
+    this.service
+      .getCharacteristic(this.platform.Characteristic.TargetHeaterCoolerState)
+      .onSet(this.setTargetHeaterCoolerState.bind(this))
+      .onGet(this.getTargetHeaterCoolerState.bind(this))
+
+    // Current Temperature (required) - current room temperature
+    this.service
+      .getCharacteristic(this.platform.Characteristic.CurrentTemperature)
+      .onGet(this.getCurrentTemperature.bind(this))
+
+    // Cooling Threshold Temperature - target temperature when cooling
+    this.service
+      .getCharacteristic(
+        this.platform.Characteristic.CoolingThresholdTemperature
+      )
+      .setProps({
+        minValue: 16,
+        maxValue: 32,
+        minStep: 1
+      })
+      .onSet(this.setCoolingThresholdTemperature.bind(this))
+      .onGet(this.getCoolingThresholdTemperature.bind(this))
+
+    // Heating Threshold Temperature - target temperature when heating
+    this.service
+      .getCharacteristic(
+        this.platform.Characteristic.HeatingThresholdTemperature
+      )
+      .setProps({
+        minValue: 16,
+        maxValue: 32,
+        minStep: 1
+      })
+      .onSet(this.setHeatingThresholdTemperature.bind(this))
+      .onGet(this.getHeatingThresholdTemperature.bind(this))
+
+    // Rotation Speed - fan speed
+    this.service
+      .getCharacteristic(this.platform.Characteristic.RotationSpeed)
+      .setProps({
+        minValue: 0,
+        maxValue: 100,
+        minStep: 20 // 5 levels: 0, 20, 40, 60, 80, 100
+      })
+      .onSet(this.setRotationSpeed.bind(this))
+      .onGet(this.getRotationSpeed.bind(this))
+
+    // Start polling for status updates
+    this.startPolling()
+
+    // Initial state fetch
+    this.updateDeviceState()
+  }
 
   /**
-   * These are just used to create a working example
-   * You should implement your own code to track the state of your accessory
+   * Starts polling the device for status updates
    */
-  private exampleStates = {
-    On: false,
-    Brightness: 100,
-  };
+  private startPolling () {
+    const pollIntervalSeconds = this.platform.daikinConfig.pollInterval || 30
 
-  constructor(
-    private readonly platform: ExampleHomebridgePlatform,
-    private readonly accessory: PlatformAccessory,
-  ) {
-    // set accessory information
-    this.accessory.getService(this.platform.Service.AccessoryInformation)!
-      .setCharacteristic(this.platform.Characteristic.Manufacturer, 'Default-Manufacturer')
-      .setCharacteristic(this.platform.Characteristic.Model, 'Default-Model')
-      .setCharacteristic(this.platform.Characteristic.SerialNumber, 'Default-Serial');
+    this.pollInterval = setInterval(async () => {
+      try {
+        await this.updateDeviceState()
+      } catch (error) {
+        this.platform.log.error('Error polling device state:', error)
+      }
+    }, pollIntervalSeconds * 1000)
+  }
 
-    // get the LightBulb service if it exists, otherwise create a new LightBulb service
-    // you can create multiple services for each accessory
+  /**
+   * Stops polling the device
+   */
+  private stopPolling () {
+    if (this.pollInterval) {
+      clearInterval(this.pollInterval)
+      this.pollInterval = null
+    }
+  }
 
-    if (accessory.context.device.CustomService) {
-      // This is only required when using Custom Services and Characteristics not support by HomeKit
-      this.service = this.accessory.getService(this.platform.CustomServices[accessory.context.device.CustomService]) ||
-        this.accessory.addService(this.platform.CustomServices[accessory.context.device.CustomService]);
-    } else {
-      this.service = this.accessory.getService(this.platform.Service.Lightbulb) || this.accessory.addService(this.platform.Service.Lightbulb);
+  /**
+   * Updates the device state from the AC unit
+   */
+  private async updateDeviceState () {
+    try {
+      const response = await this.client.getState()
+      this.currentState = response.port1
+
+      // Update HomeKit characteristics with current values
+      this.service.updateCharacteristic(
+        this.platform.Characteristic.Active,
+        this.currentState.power
+      )
+
+      this.service.updateCharacteristic(
+        this.platform.Characteristic.CurrentTemperature,
+        this.currentState.sensors.room_temp
+      )
+
+      this.service.updateCharacteristic(
+        this.platform.Characteristic.CurrentHeaterCoolerState,
+        this.mapACModeToCurrentState(
+          this.currentState.mode,
+          this.currentState.power
+        )
+      )
+
+      this.service.updateCharacteristic(
+        this.platform.Characteristic.TargetHeaterCoolerState,
+        this.mapACModeToTargetState(this.currentState.mode)
+      )
+
+      this.service.updateCharacteristic(
+        this.platform.Characteristic.CoolingThresholdTemperature,
+        this.currentState.temperature
+      )
+
+      this.service.updateCharacteristic(
+        this.platform.Characteristic.HeatingThresholdTemperature,
+        this.currentState.temperature
+      )
+
+      this.service.updateCharacteristic(
+        this.platform.Characteristic.RotationSpeed,
+        this.mapFanSpeedToRotationSpeed(this.currentState.fan)
+      )
+    } catch (error) {
+      this.platform.log.error('Failed to update device state:', error)
+    }
+  }
+
+  // Mapping helper methods
+  private mapACModeToCurrentState (mode: ACMode, power: number): number {
+    if (!power) {
+      return this.platform.Characteristic.CurrentHeaterCoolerState.INACTIVE
     }
 
-    // set the service name, this is what is displayed as the default name on the Home app
-    // in this example we are using the name we stored in the `accessory.context` in the `discoverDevices` method.
-    this.service.setCharacteristic(this.platform.Characteristic.Name, accessory.context.device.exampleDisplayName);
-
-    // each service must implement at-minimum the "required characteristics" for the given service type
-    // see https://developers.homebridge.io/#/service/Lightbulb
-
-    // register handlers for the On/Off Characteristic
-    this.service.getCharacteristic(this.platform.Characteristic.On)
-      .onSet(this.setOn.bind(this)) // SET - bind to the `setOn` method below
-      .onGet(this.getOn.bind(this)); // GET - bind to the `getOn` method below
-
-    // register handlers for the Brightness Characteristic
-    this.service.getCharacteristic(this.platform.Characteristic.Brightness)
-      .onSet(this.setBrightness.bind(this)); // SET - bind to the `setBrightness` method below
-
-    /**
-     * Creating multiple services of the same type.
-     *
-     * To avoid "Cannot add a Service with the same UUID another Service without also defining a unique 'subtype' property." error,
-     * when creating multiple services of the same type, you need to use the following syntax to specify a name and subtype id:
-     * this.accessory.getService('NAME') || this.accessory.addService(this.platform.Service.Lightbulb, 'NAME', 'USER_DEFINED_SUBTYPE_ID');
-     *
-     * The USER_DEFINED_SUBTYPE must be unique to the platform accessory (if you platform exposes multiple accessories, each accessory
-     * can use the same subtype id.)
-     */
-
-    // Example: add two "motion sensor" services to the accessory
-    const motionSensorOneService = this.accessory.getService('Motion Sensor One Name')
-      || this.accessory.addService(this.platform.Service.MotionSensor, 'Motion Sensor One Name', 'YourUniqueIdentifier-1');
-
-    const motionSensorTwoService = this.accessory.getService('Motion Sensor Two Name')
-      || this.accessory.addService(this.platform.Service.MotionSensor, 'Motion Sensor Two Name', 'YourUniqueIdentifier-2');
-
-    /**
-     * Updating characteristics values asynchronously.
-     *
-     * Example showing how to update the state of a Characteristic asynchronously instead
-     * of using the `on('get')` handlers.
-     * Here we change update the motion sensor trigger states on and off every 10 seconds
-     * the `updateCharacteristic` method.
-     *
-     */
-    let motionDetected = false;
-    setInterval(() => {
-      // EXAMPLE - inverse the trigger
-      motionDetected = !motionDetected;
-
-      // push the new value to HomeKit
-      motionSensorOneService.updateCharacteristic(this.platform.Characteristic.MotionDetected, motionDetected);
-      motionSensorTwoService.updateCharacteristic(this.platform.Characteristic.MotionDetected, !motionDetected);
-
-      this.platform.log.debug('Triggering motionSensorOneService:', motionDetected);
-      this.platform.log.debug('Triggering motionSensorTwoService:', !motionDetected);
-    }, 10000);
+    switch (mode) {
+      case ACMode.COOL:
+        return this.platform.Characteristic.CurrentHeaterCoolerState.COOLING
+      case ACMode.HEAT:
+        return this.platform.Characteristic.CurrentHeaterCoolerState.HEATING
+      case ACMode.AUTO:
+        // For auto mode, we'll assume cooling for now
+        return this.platform.Characteristic.CurrentHeaterCoolerState.COOLING
+      default:
+        return this.platform.Characteristic.CurrentHeaterCoolerState.IDLE
+    }
   }
 
-  /**
-   * Handle "SET" requests from HomeKit
-   * These are sent when the user changes the state of an accessory, for example, turning on a Light bulb.
-   */
-  async setOn(value: CharacteristicValue) {
-    // implement your own code to turn your device on/off
-    this.exampleStates.On = value as boolean;
-
-    this.platform.log.debug('Set Characteristic On ->', value);
+  private mapACModeToTargetState (mode: ACMode): number {
+    switch (mode) {
+      case ACMode.COOL:
+        return this.platform.Characteristic.TargetHeaterCoolerState.COOL
+      case ACMode.HEAT:
+        return this.platform.Characteristic.TargetHeaterCoolerState.HEAT
+      case ACMode.AUTO:
+        return this.platform.Characteristic.TargetHeaterCoolerState.AUTO
+      default:
+        return this.platform.Characteristic.TargetHeaterCoolerState.AUTO
+    }
   }
 
-  /**
-   * Handle the "GET" requests from HomeKit
-   * These are sent when HomeKit wants to know the current state of the accessory, for example, checking if a Light bulb is on.
-   *
-   * GET requests should return as fast as possible. A long delay here will result in
-   * HomeKit being unresponsive and a bad user experience in general.
-   *
-   * If your device takes time to respond you should update the status of your device
-   * asynchronously instead using the `updateCharacteristic` method instead.
-   * In this case, you may decide not to implement `onGet` handlers, which may speed up
-   * the responsiveness of your device in the Home app.
-
-   * @example
-   * this.service.updateCharacteristic(this.platform.Characteristic.On, true)
-   */
-  async getOn(): Promise<CharacteristicValue> {
-    // implement your own code to check if the device is on
-    const isOn = this.exampleStates.On;
-
-    this.platform.log.debug('Get Characteristic On ->', isOn);
-
-    // if you need to return an error to show the device as "Not Responding" in the Home app:
-    // throw new this.platform.api.hap.HapStatusError(this.platform.api.hap.HAPStatus.SERVICE_COMMUNICATION_FAILURE);
-
-    return isOn;
+  private mapTargetStateToACMode (targetState: number): ACMode {
+    switch (targetState) {
+      case this.platform.Characteristic.TargetHeaterCoolerState.COOL:
+        return ACMode.COOL
+      case this.platform.Characteristic.TargetHeaterCoolerState.HEAT:
+        return ACMode.HEAT
+      case this.platform.Characteristic.TargetHeaterCoolerState.AUTO:
+        return ACMode.AUTO
+      default:
+        return ACMode.AUTO
+    }
   }
 
-  /**
-   * Handle "SET" requests from HomeKit
-   * These are sent when the user changes the state of an accessory, for example, changing the Brightness
-   */
-  async setBrightness(value: CharacteristicValue) {
-    // implement your own code to set the brightness
-    this.exampleStates.Brightness = value as number;
+  private mapFanSpeedToRotationSpeed (fanSpeed: FanSpeed): number {
+    switch (fanSpeed) {
+      case FanSpeed.AUTO:
+        return 0
+      case FanSpeed.QUIET:
+        return 10
+      case FanSpeed.LEVEL_1:
+        return 20
+      case FanSpeed.LEVEL_2:
+        return 40
+      case FanSpeed.LEVEL_3:
+        return 60
+      case FanSpeed.LEVEL_4:
+        return 80
+      case FanSpeed.LEVEL_5:
+        return 100
+      default:
+        return 0
+    }
+  }
 
-    this.platform.log.debug('Set Characteristic Brightness -> ', value);
+  private mapRotationSpeedToFanSpeed (rotationSpeed: number): FanSpeed {
+    if (rotationSpeed === 0) return FanSpeed.AUTO
+    if (rotationSpeed <= 15) return FanSpeed.QUIET
+    if (rotationSpeed <= 30) return FanSpeed.LEVEL_1
+    if (rotationSpeed <= 50) return FanSpeed.LEVEL_2
+    if (rotationSpeed <= 70) return FanSpeed.LEVEL_3
+    if (rotationSpeed <= 90) return FanSpeed.LEVEL_4
+    return FanSpeed.LEVEL_5
+  }
+
+  // Characteristic handlers
+  async setActive (value: CharacteristicValue) {
+    const active = value as number
+    this.platform.log.debug('Set Active ->', active)
+
+    try {
+      if (active) {
+        await this.client.turnOn()
+      } else {
+        await this.client.turnOff()
+      }
+    } catch (error) {
+      this.platform.log.error('Failed to set active state:', error)
+      throw new this.platform.api.hap.HapStatusError(
+        this.platform.api.hap.HAPStatus.SERVICE_COMMUNICATION_FAILURE
+      )
+    }
+  }
+
+  async getActive (): Promise<CharacteristicValue> {
+    if (!this.currentState) {
+      return 0
+    }
+    return this.currentState.power
+  }
+
+  async getCurrentHeaterCoolerState (): Promise<CharacteristicValue> {
+    if (!this.currentState) {
+      return this.platform.Characteristic.CurrentHeaterCoolerState.INACTIVE
+    }
+    return this.mapACModeToCurrentState(
+      this.currentState.mode,
+      this.currentState.power
+    )
+  }
+
+  async setTargetHeaterCoolerState (value: CharacteristicValue) {
+    const targetState = value as number
+    this.platform.log.debug('Set Target Heater Cooler State ->', targetState)
+
+    try {
+      const mode = this.mapTargetStateToACMode(targetState)
+      await this.client.setMode(mode)
+    } catch (error) {
+      this.platform.log.error(
+        'Failed to set target heater cooler state:',
+        error
+      )
+      throw new this.platform.api.hap.HapStatusError(
+        this.platform.api.hap.HAPStatus.SERVICE_COMMUNICATION_FAILURE
+      )
+    }
+  }
+
+  async getTargetHeaterCoolerState (): Promise<CharacteristicValue> {
+    if (!this.currentState) {
+      return this.platform.Characteristic.TargetHeaterCoolerState.AUTO
+    }
+    return this.mapACModeToTargetState(this.currentState.mode)
+  }
+
+  async getCurrentTemperature (): Promise<CharacteristicValue> {
+    if (!this.currentState) {
+      return 20 // Default temperature
+    }
+    return this.currentState.sensors.room_temp
+  }
+
+  async setCoolingThresholdTemperature (value: CharacteristicValue) {
+    const temperature = value as number
+    this.platform.log.debug('Set Cooling Threshold Temperature ->', temperature)
+
+    try {
+      await this.client.setTemperature(temperature)
+    } catch (error) {
+      this.platform.log.error(
+        'Failed to set cooling threshold temperature:',
+        error
+      )
+      throw new this.platform.api.hap.HapStatusError(
+        this.platform.api.hap.HAPStatus.SERVICE_COMMUNICATION_FAILURE
+      )
+    }
+  }
+
+  async getCoolingThresholdTemperature (): Promise<CharacteristicValue> {
+    if (!this.currentState) {
+      return 24 // Default temperature
+    }
+    return this.currentState.temperature
+  }
+
+  async setHeatingThresholdTemperature (value: CharacteristicValue) {
+    const temperature = value as number
+    this.platform.log.debug('Set Heating Threshold Temperature ->', temperature)
+
+    try {
+      await this.client.setTemperature(temperature)
+    } catch (error) {
+      this.platform.log.error(
+        'Failed to set heating threshold temperature:',
+        error
+      )
+      throw new this.platform.api.hap.HapStatusError(
+        this.platform.api.hap.HAPStatus.SERVICE_COMMUNICATION_FAILURE
+      )
+    }
+  }
+
+  async getHeatingThresholdTemperature (): Promise<CharacteristicValue> {
+    if (!this.currentState) {
+      return 24 // Default temperature
+    }
+    return this.currentState.temperature
+  }
+
+  async setRotationSpeed (value: CharacteristicValue) {
+    const rotationSpeed = value as number
+    this.platform.log.debug('Set Rotation Speed ->', rotationSpeed)
+
+    try {
+      const fanSpeed = this.mapRotationSpeedToFanSpeed(rotationSpeed)
+      await this.client.setFanSpeed(fanSpeed)
+    } catch (error) {
+      this.platform.log.error('Failed to set rotation speed:', error)
+      throw new this.platform.api.hap.HapStatusError(
+        this.platform.api.hap.HAPStatus.SERVICE_COMMUNICATION_FAILURE
+      )
+    }
+  }
+
+  async getRotationSpeed (): Promise<CharacteristicValue> {
+    if (!this.currentState) {
+      return 0
+    }
+    return this.mapFanSpeedToRotationSpeed(this.currentState.fan)
   }
 }

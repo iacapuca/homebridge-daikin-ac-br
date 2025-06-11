@@ -1,5 +1,5 @@
 {
-  "pluginAlias": "ExampleHomebridgePlugin",
+  "pluginAlias": "DaikinACBrazil",
   "pluginType": "platform",
   "singular": true,
   "strictValidation": false,
@@ -10,7 +10,29 @@
         "title": "Name",
         "type": "string",
         "required": true,
-        "default": "Example Dynamic Platform"
+        "default": "Daikin AC Brazil"
+      },
+      "secretKey": {
+        "title": "Secret Key",
+        "type": "string",
+        "required": true,
+        "description": "The secret key for your Daikin AC unit. You can extract this using the Daikin Smart AC app or the extraction service."
+      },
+      "discoveryTimeout": {
+        "title": "Discovery Timeout (seconds)",
+        "type": "integer",
+        "default": 10,
+        "minimum": 5,
+        "maximum": 60,
+        "description": "How long to wait for device discovery on the network."
+      },
+      "pollInterval": {
+        "title": "Status Poll Interval (seconds)",
+        "type": "integer",
+        "default": 30,
+        "minimum": 10,
+        "maximum": 300,
+        "description": "How often to poll the AC unit for status updates."
       }
     }
   }

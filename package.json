@@ -1,22 +1,26 @@
 {
-  "name": "homebridge-plugin-name",
-  "displayName": "Plugin Name",
+  "name": "homebridge-daikin-ac-br",
+  "displayName": "Daikin AC Brazil",
   "type": "module",
   "version": "1.0.0",
   "private": true,
-  "description": "A short description about what your plugin does.",
-  "author": "Your Name",
+  "description": "Homebridge plugin for Daikin Split EcoSwing Smart R-32 and Split EcoSwing Smart Gold R-32 air conditioners (Brazil market).",
+  "author": "Pedro Paes",
   "license": "Apache-2.0",
-  "homepage": "https://github.com/USERNAME/GITHUB_PROJECT_NAME#readme",
+  "homepage": "https://github.com/pedropaes/homebridge-daikin-ac-br#readme",
   "repository": {
     "type": "git",
-    "url": "https://github.com/USERNAME/GITHUB_PROJECT_NAME.git"
+    "url": "https://github.com/pedropaes/homebridge-daikin-ac-br.git"
   },
   "bugs": {
-    "url": "https://github.com/USERNAME/GITHUB_PROJECT_NAME/issues"
+    "url": "https://github.com/pedropaes/homebridge-daikin-ac-br/issues"
   },
   "keywords": [
-    "homebridge-plugin"
+    "homebridge-plugin",
+    "daikin",
+    "air-conditioner",
+    "smart-ac",
+    "brazil"
   ],
   "main": "dist/index.js",
   "engines": {
